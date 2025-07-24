@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/YakDriver/regexache"
@@ -19,6 +21,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	awstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/hashicorp/aws-sdk-go-base/v2/tfawserr"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/customdiff"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/id"
@@ -1099,6 +1102,11 @@ func resourceService() *schema.Resource {
 			},
 			names.AttrTags:    tftags.TagsSchema(),
 			names.AttrTagsAll: tftags.TagsSchemaComputed(),
+			"sigint_cancellation": {
+				Type:     schema.TypeBool,
+				Optional: true,
+				Default:  false,
+			},
 			"task_definition": {
 				Type:     schema.TypeString,
 				Optional: true,
@@ -1430,7 +1438,7 @@ func resourceServiceCreate(ctx context.Context, d *schema.ResourceData, meta any
 	d.Set(names.AttrARN, output.Service.ServiceArn)
 
 	if d.Get("wait_for_steady_state").(bool) {
-		if _, err := waitServiceStable(ctx, conn, d.Id(), d.Get("cluster").(string), operationTime, d.Timeout(schema.TimeoutCreate)); err != nil {
+		if _, err := waitServiceStable(ctx, conn, d.Id(), d.Get("cluster").(string), operationTime, d.Get("sigint_cancellation"), d.Timeout(schema.TimeoutCreate)); err != nil {
 			return sdkdiag.AppendErrorf(diags, "waiting for ECS Service (%s) create: %s", d.Id(), err)
 		}
 	} else if _, err := waitServiceActive(ctx, conn, d.Id(), d.Get("cluster").(string), d.Timeout(schema.TimeoutCreate)); err != nil {
@@ -1790,7 +1798,7 @@ func resourceServiceUpdate(ctx context.Context, d *schema.ResourceData, meta any
 		}
 
 		if d.Get("wait_for_steady_state").(bool) {
-			if _, err := waitServiceStable(ctx, conn, d.Id(), cluster, operationTime, d.Timeout(schema.TimeoutUpdate)); err != nil {
+			if _, err := waitServiceStable(ctx, conn, d.Id(), cluster, operationTime, d.Get("sigint_cancellation"), d.Timeout(schema.TimeoutUpdate)); err != nil {
 				return sdkdiag.AppendErrorf(diags, "waiting for ECS Service (%s) update: %s", d.Id(), err)
 			}
 		} else if _, err := waitServiceActive(ctx, conn, d.Id(), cluster, d.Timeout(schema.TimeoutUpdate)); err != nil {
@@ -2080,6 +2088,13 @@ const (
 	serviceStatusStable  = "tfSTABLE"
 )
 
+var deploymentTerminalStates = []string{
+	string(awstypes.ServiceDeploymentStatusSuccessful),
+	string(awstypes.ServiceDeploymentStatusStopped),
+	string(awstypes.ServiceDeploymentStatusRollbackFailed),
+	string(awstypes.ServiceDeploymentStatusRollbackSuccessful),
+}
+
 func statusService(ctx context.Context, conn *ecs.Client, serviceName, clusterNameOrARN string) retry.StateRefreshFunc {
 	return func() (any, string, error) {
 		output, err := findServiceNoTagsByTwoPartKey(ctx, conn, serviceName, clusterNameOrARN)
@@ -2161,7 +2176,7 @@ func statusServiceWaitForStable(ctx context.Context, conn *ecs.Client, serviceNa
 
 func findPrimaryTaskSet(deployments []awstypes.Deployment) *awstypes.Deployment {
 	for _, deployment := range deployments {
-		if aws.ToString(deployment.Status) == "PRIMARY" {
+		if aws.ToString(deployment.Status) == taskSetStatusPrimary {
 			return &deployment
 		}
 	}
@@ -2232,9 +2247,152 @@ func findDeploymentStatus(ctx context.Context, conn *ecs.Client, deploymentArn s
 	}
 }
 
+func waitForCancellation(ctx context.Context, conn *ecs.Client, clusterName string, service *awstypes.Service, wg *sync.WaitGroup, operationTime time.Time) {
+	tflog.Info(ctx, "ENTERED WAIT FOR CANCEL", map[string]interface{}{})
+	defer wg.Done()
+	select {
+	case <-ctx.Done():
+		tflog.Info(ctx, "CANCELLATION TRIGGERED", map[string]interface{}{})
+		log.Printf("[INFO] Detected cancellation, initiating rollback for deployment")
+		newContext := context.Background()
+		service, err := rollbackDeploymentToPrimary(newContext, conn, clusterName, service, operationTime)
+		if err != nil {
+			log.Printf("[ERROR] Failed to rollback deployment: %s", err)
+		} else {
+			log.Printf("[INFO] Rollback successful. Service state: %s", aws.ToString(service.Status))
+		}
+	}
+	tflog.Info(ctx, "CANCELLATION DONE", map[string]interface{}{})
+}
+
+func rollbackDeploymentToPrimary(ctx context.Context, conn *ecs.Client, clusterName string, service *awstypes.Service, operationTime time.Time) (*awstypes.Service, error) {
+	var primaryTaskSet *awstypes.Deployment
+	for _, deployment := range service.Deployments {
+		if aws.ToString(deployment.Status) == taskSetStatusPrimary {
+			primaryTaskSet = &deployment
+			break
+		}
+	}
+	if primaryTaskSet == nil {
+		return nil, fmt.Errorf("no PRIMARY deployment found for service %s", aws.ToString(service.ServiceName))
+	}
+
+	serviceName := aws.ToString(service.ServiceArn)
+	serviceDeploymentARN, err := findPrimaryDeploymentARN(ctx, conn, primaryTaskSet, serviceName, clusterName, operationTime)
+
+	if err != nil || slices.Contains(deploymentTerminalStates, aws.ToString(primaryTaskSet.Status)) {
+		return nil, err
+	}
+
+	input := &ecs.StopServiceDeploymentInput{
+		ServiceDeploymentArn: serviceDeploymentARN,
+		StopType:             awstypes.StopServiceDeploymentStopTypeRollback,
+	}
+
+	_, err = conn.StopServiceDeployment(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+
+	err = waitForDeploymentTerminalStatus(ctx, conn, clusterName, *serviceDeploymentARN, aws.ToString(primaryTaskSet.Id))
+	if err != nil {
+		return nil, err
+	}
+
+	return revertServiceToBlueVersion(ctx, conn, clusterName, serviceName)
+}
+
+func waitForDeploymentTerminalStatus(ctx context.Context, conn *ecs.Client, clusterName, serviceDeploymentARN, deploymentID string) error {
+	stateConf := &retry.StateChangeConf{
+		// NOTE: SHOULD BELOW BE OF THE NON-STANDARD serviceStatusPending (i.e. "tfPENDING") values?
+		Pending: []string{string(awstypes.ServiceDeploymentStatusInProgress), string(awstypes.ServiceDeploymentStatusPending)},
+		Target:  deploymentTerminalStates,
+		Refresh: func() (interface{}, string, error) {
+			status, err := findDeploymentStatus(ctx, conn, serviceDeploymentARN)
+			return nil, status, err
+		},
+		Timeout: 1 * time.Hour, // Maximum time before SIGKILL
+	}
+
+	_, err := stateConf.WaitForStateContext(ctx)
+	return err
+}
+
+func revertServiceToBlueVersion(ctx context.Context, conn *ecs.Client, clusterName, serviceName string) (*awstypes.Service, error) {
+	input := &ecs.DescribeServicesInput{
+		Cluster:  aws.String(clusterName),
+		Services: []string{serviceName},
+	}
+
+	output, err := conn.DescribeServices(ctx, input) // TODO: Use DescribeServiceDeployments()
+	if err != nil {
+		return nil, err
+	}
+
+	if len(output.Services) == 0 {
+		return nil, fmt.Errorf("service %s not found", serviceName)
+	}
+
+	service := output.Services[0]
+
+	var blueTaskDefinition string
+	for _, deployment := range service.Deployments {
+		if aws.ToString(deployment.Status) != taskSetStatusPrimary {
+			blueTaskDefinition = aws.ToString(deployment.TaskDefinition)
+			break
+		}
+	}
+
+	if blueTaskDefinition == "" {
+		return nil, fmt.Errorf("could not find previous (blue) task definition")
+	}
+
+	updateInput := &ecs.UpdateServiceInput{
+		Cluster:        aws.String(clusterName),
+		Service:        aws.String(serviceName),
+		TaskDefinition: aws.String(blueTaskDefinition),
+	}
+
+	_, err = conn.UpdateService(ctx, updateInput)
+	if err != nil {
+		return nil, err
+	}
+
+	stateConf := &retry.StateChangeConf{
+		Pending: []string{serviceStatusInactive, serviceStatusDraining, serviceStatusPending},
+		Target:  []string{serviceStatusStable},
+		Refresh: statusServiceWaitForStable(ctx, conn, serviceName, clusterName),
+		Timeout: 1 * time.Hour,
+	}
+
+	outputRaw, err := stateConf.WaitForStateContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if output, ok := outputRaw.(*awstypes.Service); ok {
+		return output, nil
+	}
+
+	return nil, fmt.Errorf("error updating service to blue version: unexpected output type")
+}
+
 // waitServiceStable waits for an ECS Service to reach the status "ACTIVE" and have all desired tasks running.
 // Does not return tags.
-func waitServiceStable(ctx context.Context, conn *ecs.Client, serviceName, clusterNameOrARN string, operationTime time.Time, timeout time.Duration) (*awstypes.Service, error) { //nolint:unparam
+func waitServiceStable(ctx context.Context, conn *ecs.Client, serviceName, clusterNameOrARN string, operationTime time.Time, sigintCancellation bool, timeout time.Duration) (*awstypes.Service, error) { //nolint:unparam
+	wg := &sync.WaitGroup{}
+	tflog.Info(ctx, "SIGINT CANCELLATION VALUE", map[string]interface{}{
+		"SIGINT_CANCELLATION_VALUE": sigintCancellation,
+	})
+
+	// NOTE: if user is updating their task definition, they must apply lifecycle attribute create_before_destroy = true to the resource template
+	if sigintCancellation {
+		wg.Add(1)
+
+		tflog.Info(ctx, "GO ROUTINE STARTING", map[string]interface{}{})
+		go waitForCancellation(ctx, conn, clusterNameOrARN, service, wg, operationTime)
+	}
+
 	stateConf := &retry.StateChangeConf{
 		Pending: []string{serviceStatusInactive, serviceStatusDraining, serviceStatusPending},
 		Target:  []string{serviceStatusStable},
@@ -2243,6 +2401,10 @@ func waitServiceStable(ctx context.Context, conn *ecs.Client, serviceName, clust
 	}
 
 	outputRaw, err := stateConf.WaitForStateContext(ctx)
+
+	if sigintCancellation {
+		wg.Wait()
+	}
 
 	if output, ok := outputRaw.(*awstypes.Service); ok {
 		return output, err
