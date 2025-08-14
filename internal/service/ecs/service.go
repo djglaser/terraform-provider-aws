@@ -2111,7 +2111,7 @@ func statusService(ctx context.Context, conn *ecs.Client, serviceName, clusterNa
 	}
 }
 
-func statusServiceWaitForStable(ctx context.Context, conn *ecs.Client, serviceName, clusterNameOrARN string, primaryTaskSet *awstypes.Deployment, operationTime time.Time) retry.StateRefreshFunc {
+func statusServiceWaitForStable(ctx context.Context, conn *ecs.Client, serviceName, clusterNameOrARN string, primaryTaskSet **awstypes.Deployment, operationTime time.Time) retry.StateRefreshFunc {
 	var primaryDeploymentArn *string
 	var isNewPrimaryDeployment bool
 
@@ -2127,11 +2127,14 @@ func statusServiceWaitForStable(ctx context.Context, conn *ecs.Client, serviceNa
 
 		output := outputRaw.(*awstypes.Service)
 
-		if primaryTaskSet == nil {
-			primaryTaskSet = findPrimaryTaskSet(output.Deployments)
+		if *primaryTaskSet == nil {
+			tflog.Info(ctx, "UPDATING_PTS", map[string]interface{}{
+				": ": *primaryTaskSet,
+			})
+			*primaryTaskSet = findPrimaryTaskSet(output.Deployments)
 
-			if primaryTaskSet != nil && primaryTaskSet.CreatedAt != nil {
-				createdAtUTC := primaryTaskSet.CreatedAt.UTC()
+			if *primaryTaskSet != nil && (*primaryTaskSet).CreatedAt != nil {
+				createdAtUTC := (*primaryTaskSet).CreatedAt.UTC()
 				isNewPrimaryDeployment = createdAtUTC.After(operationTime)
 			}
 		}
@@ -2146,7 +2149,7 @@ func statusServiceWaitForStable(ctx context.Context, conn *ecs.Client, serviceNa
 				serviceArn := aws.ToString(output.ServiceArn)
 
 				var err error
-				primaryDeploymentArn, err = findPrimaryDeploymentARN(ctx, conn, primaryTaskSet, serviceArn, clusterNameOrARN, operationTime)
+				primaryDeploymentArn, err = findPrimaryDeploymentARN(ctx, conn, *primaryTaskSet, serviceArn, clusterNameOrARN, operationTime)
 
 				if err != nil {
 					return nil, "", err
@@ -2246,36 +2249,55 @@ func findDeploymentStatus(ctx context.Context, conn *ecs.Client, deploymentArn s
 	}
 }
 
-func waitForCancellation(ctx context.Context, conn *ecs.Client, clusterName, serviceName string, primaryTaskSet *awstypes.Deployment, wg *sync.WaitGroup, operationTime time.Time) {
+func waitForCancellation(ctx context.Context, conn *ecs.Client, clusterName, serviceName string, primaryTaskSet **awstypes.Deployment, wg *sync.WaitGroup, operationTime time.Time) {
 	tflog.Info(ctx, "ENTERED WAIT FOR CANCEL", map[string]interface{}{})
 	defer wg.Done()
 	select {
 	case <-ctx.Done():
-		tflog.Info(ctx, "CANCELLATION TRIGGERED", map[string]interface{}{})
+		tflog.Info(ctx, "CANCELLATION TRIGGERED", map[string]interface{}{"PTS: ": *primaryTaskSet})
 		log.Printf("[INFO] Detected cancellation, initiating rollback for deployment")
 		newContext := context.Background()
-		err := rollbackBlueGreenDeployment(newContext, conn, clusterName, serviceName, primaryTaskSet, operationTime)
+		err := rollbackBlueGreenDeployment(newContext, conn, clusterName, serviceName, *primaryTaskSet, operationTime)
 		if err != nil {
 			fmt.Printf("[ERROR] Failed to rollback deployment: %s", err)
 		} else {
 			fmt.Printf("[INFO] Rollback successful.")
 		}
 	}
-	tflog.Info(ctx, "CANCELLATION DONE", map[string]interface{}{})
 }
 
 func rollbackBlueGreenDeployment(ctx context.Context, conn *ecs.Client, clusterName, serviceName string, primaryTaskSet *awstypes.Deployment, operationTime time.Time) error {
 	if primaryTaskSet == nil {
-		return fmt.Errorf("no PRIMARY deployment found for service %s", serviceName)
+		tflog.Info(ctx, "DESCRIBESERVICES IN ROLLBACK", map[string]interface{}{})
+		service, err := conn.DescribeServices(ctx, &ecs.DescribeServicesInput{
+			Cluster:  aws.String(clusterName),
+			Services: []string{serviceName},
+		})
+		if err != nil {
+			return err
+		}
+		if len(service.Services) > 0 {
+			primaryTaskSet = findPrimaryTaskSet(service.Services[0].Deployments)
+		}
+		if primaryTaskSet == nil {
+			return fmt.Errorf("no PRIMARY deployment found for service %s", serviceName)
+		}
+	}
+
+	// Check if deployment is already in terminal state, meaning rollback is not needed
+	if slices.Contains(deploymentTerminalStates, aws.ToString(primaryTaskSet.Status)) {
+		return nil
 	}
 
 	serviceDeploymentARN, err := findPrimaryDeploymentARN(ctx, conn, primaryTaskSet, serviceName, clusterName, operationTime)
-
-	tflog.Info(ctx, "PRIMARY DEPLOYMENT FOR ROLLBACK", map[string]interface{}{"PDARN": serviceDeploymentARN})
-
-	if err != nil || slices.Contains(deploymentTerminalStates, aws.ToString(primaryTaskSet.Status)) {
+	if err != nil {
 		return err
 	}
+	if serviceDeploymentARN == nil {
+		return fmt.Errorf("no PRIMARY deployment found for service %s", serviceName)
+	}
+
+	tflog.Info(ctx, "PRIMARY DEPLOYMENT FOR ROLLBACK", map[string]interface{}{"PDARN": serviceDeploymentARN})
 
 	input := &ecs.StopServiceDeploymentInput{
 		ServiceDeploymentArn: serviceDeploymentARN,
@@ -2288,12 +2310,7 @@ func rollbackBlueGreenDeployment(ctx context.Context, conn *ecs.Client, clusterN
 	}
 
 	tflog.Info(ctx, "STOP TRIGGERED", map[string]interface{}{})
-	err = waitForDeploymentTerminalStatus(ctx, conn, *serviceDeploymentARN)
-	if err != nil {
-		return err
-	}
-	return nil
-	// return revertServiceToBlueVersion(ctx, conn, clusterName, serviceName, operationTime)
+	return waitForDeploymentTerminalStatus(ctx, conn, *serviceDeploymentARN)
 }
 
 func waitForDeploymentTerminalStatus(ctx context.Context, conn *ecs.Client, serviceDeploymentARN string) error {
@@ -2384,12 +2401,11 @@ func waitServiceStable(ctx context.Context, conn *ecs.Client, serviceName, clust
 	})
 	wg := &sync.WaitGroup{}
 
-	var primaryTaskSet *awstypes.Deployment
+	var primaryTaskSet **awstypes.Deployment = new(*awstypes.Deployment)
 
-	// NOTE: if user is updating their task definition, they must apply lifecycle attribute create_before_destroy = true to the resource template
+	// Find primary task set upfront if cancellation is enabled
 	if sigintCancellation {
 		wg.Add(1)
-
 		tflog.Info(ctx, "GO ROUTINE STARTING", map[string]interface{}{})
 		go waitForCancellation(ctx, conn, clusterNameOrARN, serviceName, primaryTaskSet, wg, operationTime)
 	}
