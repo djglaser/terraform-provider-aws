@@ -267,6 +267,14 @@ func endpointsSchema() *schema.Schema {
 					Description: "Use this to override the default service endpoint URL",
 				},
 
+				// bedrockagentcore
+
+				"bedrockagentcore": {
+					Type:        schema.TypeString,
+					Optional:    true,
+					Description: "Use this to override the default service endpoint URL",
+				},
+
 				// billing
 
 				"billing": {
@@ -1922,6 +1930,14 @@ func endpointsSchema() *schema.Schema {
 				// s3tables
 
 				"s3tables": {
+					Type:        schema.TypeString,
+					Optional:    true,
+					Description: "Use this to override the default service endpoint URL",
+				},
+
+				// s3vectors
+
+				"s3vectors": {
 					Type:        schema.TypeString,
 					Optional:    true,
 					Description: "Use this to override the default service endpoint URL",
